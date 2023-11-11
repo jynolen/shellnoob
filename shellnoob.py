@@ -21,84 +21,64 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-from __future__ import print_function
-__author__ = 'Yanick Fratantonio <yanick@cs.ucsb.edu>'
-__description__ = 'Toolkit to write shellcodes'
-__version__ = "2.0"
-
+from ast import arg
+from multiprocessing import Value
 import os
 import sys
 import re
 import stat
+import io
 import traceback
 import shutil
-import socket
 from tempfile import mktemp, NamedTemporaryFile
 from subprocess import call, Popen, PIPE
 import binascii
-PY2 = sys.version_info.major == 2
+from typing import Optional
+import urllib
+import urllib.request
+import urllib.error
+import argparse
+from collections import namedtuple
+from enum import StrEnum, auto
+import logging
 
-try:
-    import IPython
-except ImportError:
-    pass
-
-if PY2:
-    import urllib2
-    input = raw_input
-    cbytes = lambda source, encoding='utf-8': bytes(source)
-    cstr = lambda source, encoding='utf-8': str(source)
-    urlread = lambda url: urllib2.urlopen(url).read()
-    HTTPError = urllib2.HTTPError
-else:
-    import urllib
-    import urllib.request
-    import urllib.error
-    cbytes = lambda source, encoding='utf-8': bytes(source, encoding)
-    cstr = lambda source, encoding='utf-8': str(source, encoding)
-    urlread = lambda url: urllib.request.urlopen(url).read()
-    HTTPError = urllib.error.HTTPError
+cbytes = lambda source, encoding='utf-8': bytes(source, encoding)
+cstr = lambda source, encoding='utf-8': str(source, encoding)
+urlread = lambda url: urllib.request.urlopen(url).read()
+HTTPError = urllib.error.HTTPError
 
 ######################
 ### main functions ###
 ######################
 
-def print_usage():
-    script_fn = os.path.basename(sys.argv[0])
-    print('%s [--from-INPUT] (input_file_path | - ) [--to-OUTPUT] [output_file_path | - ]' % script_fn, file=sys.stderr)
-    print('%s -c (prepend a breakpoint (Warning: only few platforms/OS are supported!)' % script_fn, file=sys.stderr)
-    print('%s --64 (64 bits mode, default: 32 bits)' % script_fn, file=sys.stderr)
-    print('%s --intel (intel syntax mode, default: att)' % script_fn, file=sys.stderr)
-    print('%s -q (quite mode)' % script_fn, file=sys.stderr)
-    print('%s -v (or -vv, -vvv)' % script_fn, file=sys.stderr)
-    print('%s --to-strace (compiles it & run strace)' % script_fn, file=sys.stderr)
-    print('%s --to-gdb (compiles it & run gdb & set breakpoint on entrypoint)' % script_fn, file=sys.stderr)
-    print('', file=sys.stderr)
-    print('Standalone "plugins"', file=sys.stderr)
-    print('%s -i [--to-asm | --to-opcode ] (for interactive mode)' % script_fn, file=sys.stderr)
-    print('%s --get-const <const>' % script_fn, file=sys.stderr)
-    print('%s --get-sysnum <sysnum>' % script_fn, file=sys.stderr)
-    print('%s --get-strerror <errno>' % script_fn, file=sys.stderr)
-    print('%s --file-patch <exe_fp> <file_offset> <data> (in hex). (Warning: tested only on x86/x86_64)' % script_fn, file=sys.stderr)
-    print('%s --vm-patch <exe_fp> <vm_address> <data> (in hex). (Warning: tested only on x86/x86_64)' % script_fn, file=sys.stderr)
-    print('%s --fork-nopper <exe_fp> (this nops out the calls to fork(). Warning: tested only on x86/x86_64)' % script_fn, file=sys.stderr)
-    print('', file=sys.stderr)
-    print('"Installation"', file=sys.stderr)
-    print('%s --install [--force] (this just copies the script in a convinient position)' % script_fn, file=sys.stderr)
-    print('%s --uninstall [--force]' % script_fn, file=sys.stderr)
-    print('', file=sys.stderr)
-    print('Supported INPUT format: %s' % ', '.join(ShellNoob.INPUT_FMT), file=sys.stderr)
-    print('Supported OUTPUT format: %s'  % ', '.join(ShellNoob.OUTPUT_FMT), file=sys.stderr)
-    print('All combinations from INPUT to OUTPUT are supported!', file=sys.stderr)
-    print('', file=sys.stderr)
-    print('Check out the README file for more info.', file=sys.stderr)
+class InputFormat(StrEnum):
+    ASM = auto()
+    OBJ = auto()
+    BIN = auto()
+    HEX = auto()
+    C = auto()
+    SHELLSTORM = auto()
+
+class OutputFormat(StrEnum):
+    ASM = auto()
+    OBJ = auto()
+    BIN = auto()
+    HEX = auto()
+    C = auto() 
+    COMPLETEC = auto()
+    PYTHON = auto()
+    BASH = auto()
+    RUBY = auto()
+    PRETTY = auto()
+    SAFEASM = auto()
+    
+class ShellNoobException(Exception):
+    message: str
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
 
 
 class ShellNoob():
-
-    INPUT_FMT = ['asm', 'obj', 'bin', 'hex', 'c', 'shellstorm']
-    OUTPUT_FMT = ['asm', 'obj', 'exe', 'bin', 'hex', 'c', 'completec',
-                  'python', 'bash', 'ruby', 'pretty', 'safeasm']
 
     # {kernel#hardware#flag_64_bit#flag_intel}
     objdump_options_map = {
@@ -206,10 +186,10 @@ int main() {
         self.check_compatibility()
 
     def set_conv_functions(self):
-        for i in self.INPUT_FMT:
-            for o in self.OUTPUT_FMT:
+        for i in InputFormat:
+            for o in OutputFormat:
                 func_name = '%s_to_%s' % (i, o)
-                if self.debug: print('Creating %s' % func_name, file=sys.stderr)
+                logging.debug('Creating %s' % func_name)
                 if i == o: continue
 
                 if func_name not in ShellNoob.__dict__:
@@ -234,25 +214,24 @@ int main() {
         try:
             self.get_objdump_options()
         except ShellNoobException as e:
-            print('ERROR: %s' % e.message, file=sys.stderr)
+            logging.exception('ERROR: %s' % e.message)
             sys.exit(2)
         try:
             self.get_as_options()
         except ShellNoobException as e:
-            print('ERROR: %s' % e.message, file=sys.stderr)
+            logging.exception('ERROR: %s' % e.message)
             sys.exit(2)
         try:
             self.get_ld_options()
         except ShellNoobException as e:
-            print('ERROR: %s' % e.message, file=sys.stderr)
+            logging.exception('ERROR: %s' % e.message)
             sys.exit(2)
         if self.with_breakpoint:
             try:
                 self.get_breakpoint_hex()
             except ShellNoobException as e:
-                print('ERROR: %s' % e.message, file=sys.stderr)
+                logging.exception('ERROR: %s' % e.message)
                 sys.exit(2)
-
 
     def get_objdump_options(self, kernel=None, hardware=None, flag_64_bit=None, flag_intel=None):
         # use the passed settings, if specified
@@ -267,10 +246,9 @@ int main() {
             if not re.search(e_hardware, hardware): continue
             if not re.search(e_64, flag_64_bit): continue
             if not re.search(e_intel, flag_intel): continue
-            if self.debug: print('MATCH with %s ~> %s' % (entry, options), file=sys.stderr)
+            logging.debug('MATCH with %s ~> %s' % (entry, options))
             return options
         raise ShellNoobException('objdump_options not found for the current setup')
-
 
     def get_as_options(self, kernel=None, hardware=None, flag_64_bit=None, flag_intel=None):
         # use the passed settings, if specified
@@ -285,10 +263,9 @@ int main() {
             if not re.search(e_hardware, hardware): continue
             if not re.search(e_64, flag_64_bit): continue
             if not re.search(e_intel, flag_intel): continue
-            if self.debug: print('MATCH with %s ~> %s' % (entry, options), file=sys.stderr)
+            logging.debug('MATCH with %s ~> %s' % (entry, options))
             return options
         raise ShellNoobException('as_options not found for the current setup')
-
 
     def get_ld_options(self, kernel=None, hardware=None, flag_64_bit=None, flag_intel=None):
         # use the passed settings, if specified
@@ -303,10 +280,9 @@ int main() {
             if not re.search(e_hardware, hardware): continue
             if not re.search(e_64, flag_64_bit): continue
             if not re.search(e_intel, flag_intel): continue
-            if self.debug: print('MATCH with %s ~> %s' % (entry, options), file=sys.stderr)
+            logging.debug('MATCH with %s ~> %s' % (entry, options))
             return options
         raise ShellNoobException('ld_options not found for the current setup')
-
 
     def get_gcc_options(self, kernel=None, hardware=None, flag_64_bit=None, flag_intel=None):
         # use the passed settings, if specified
@@ -321,10 +297,9 @@ int main() {
             if not re.search(e_hardware, hardware): continue
             if not re.search(e_64, flag_64_bit): continue
             if not re.search(e_intel, flag_intel): continue
-            if self.debug: print('MATCH with %s ~> %s' % (entry, options), file=sys.stderr)
+            logging.debug('MATCH with %s ~> %s' % (entry, options))
             return options
         raise ShellNoobException('gcc_options not found for the current setup')
-
 
     def get_breakpoint_hex(self, kernel=None, hardware=None):
         # use the passed settings, if specified
@@ -335,10 +310,9 @@ int main() {
             e_kernel, e_hardware = entry.split('#')
             if not re.search(e_kernel, kernel): continue
             if not re.search(e_hardware, hardware): continue
-            if self.debug: print('MATCH with %s-%s ~> %s' % (e_kernel, e_hardware, _hex), file=sys.stderr)
+            logging.debug('MATCH with %s-%s ~> %s' % (e_kernel, e_hardware, _hex))
             return _hex
         raise ShellNoobException('the breakpoint feature is not supported in the current configuration')
-
 
     def get_comment_as_char(self, kernel=None, hardware=None):
         # use the passed settings, if specified
@@ -348,7 +322,7 @@ int main() {
             e_kernel, e_hardware = entry.split('#')
             if not re.search(e_kernel, kernel): continue
             if not re.search(e_hardware, hardware): continue
-            if self.debug: print('MATCH with %s ~> %s' % (entry, comment_char), file=sys.stderr)
+            logging.debug('MATCH with %s ~> %s' % (entry, comment_char))
             return comment_char
 
 
@@ -375,7 +349,7 @@ int main() {
             try:
                 tmp_exe_fp = self.include_and_body_to_exe_fp(includes, body)
             except ShellNoobException:
-                print('ERROR: syscall %s not found for platform %s' % (syscall, platform), file=sys.stderr)
+                logging.exception('ERROR: syscall %s not found for platform %s' % (syscall, platform))
                 continue
 
             p = Popen(tmp_exe_fp, stdout=PIPE)
@@ -384,10 +358,9 @@ int main() {
             if retval == 0:
                 print('%s ~> %s' % (platform, cstr(output, "utf-8")))
             else:
-                print('ERROR: reval %s while resolving syscall %s' % (retval, syscall), file=sys.stderr)
+                logging.error('ERROR: reval %s while resolving syscall %s' % (retval, syscall))
             if not self.keep_files:
                 os.unlink(tmp_exe_fp)
-
 
     def do_resolve_const(self, const):
         includes = ['sys/types.h',
@@ -400,7 +373,7 @@ int main() {
         try:
             tmp_exe_fp = self.include_and_body_to_exe_fp(includes, body)
         except ShellNoobException:
-            print('ERROR: constant %s not found' % const, file=sys.stderr)
+            logging.error('constant %s not found' % const)
             return
 
         p = Popen(tmp_exe_fp, stdout=PIPE)
@@ -409,10 +382,9 @@ int main() {
         if retval == 0:
             print('%s ~> %s' % (const, int(output)))
         else:
-            print('ERROR: reval %s while resolving const %s' % (retval, const), file=sys.stderr)
+            logging.error('ERROR: reval %s while resolving const %s' % (retval, const))
         if not self.keep_files:
             os.unlink(tmp_exe_fp)
-
 
     def do_resolve_errno(self, errno):
         global cstr
@@ -423,7 +395,7 @@ int main() {
         try:
             tmp_exe_fp = self.include_and_body_to_exe_fp(includes, body)
         except ShellNoobException:
-            print('ERROR: errno %s not found' % const, file=sys.stderr)
+            logging.exception('ERROR: errno %s not found' % errno)
             return
 
         p = Popen(tmp_exe_fp, stdout=PIPE)
@@ -432,23 +404,17 @@ int main() {
         if retval == 0:
             print('%s ~> %s' % (errno, cstr(output, "utf-8")))
         else:
-            print('ERROR: reval %s while resolving errno %s' % (retval, errno), file=sys.stderr)
+            logging.error('ERROR: reval %s while resolving errno %s' % (retval, errno))
         if not self.keep_files:
             os.unlink(tmp_exe_fp)
 
-
-    def do_interactive_mode(self, args):
+    def do_interactive_mode(self, asm_to_opcode_flag=None):
         global cbytes
-        asm_to_opcode_flag = None
-        if '--to-opcode' in args:
-            asm_to_opcode_flag = True
-        elif '--to-asm' in args:
-            asm_to_opcode_flag = False
         if asm_to_opcode_flag is None:
             print('asm_to_opcode (1) or opcode_to_asm (2)?: ', end='')
             answer = input()
             while answer != '1' and answer != '2':
-                print('seriously? dude, choose between 1 and 2: ', end='')
+                print('Choose between 1 and 2: ', end='')
                 answer = input()
             asm_to_opcode_flag = True if answer == '1' else False
         assert asm_to_opcode_flag is not None
@@ -467,10 +433,7 @@ int main() {
                     _hex = self.ins_to_hex(ins)
                     print('%s ~> %s' % (ins, _hex))
                 except Exception as e:
-                    print('ERROR: %s' % e, file=sys.stderr)
-                    if self.verbose >= 3:
-                        print(traceback.format_exc(), file=sys.stderr)
-                        print('--------------------------', file=sys.stderr)
+                    logging.exception('ERROR: %s' % e)
                 ins = ''
         else:
             print('opcode_to_asm selected (type "quit" or ^C to end)')
@@ -488,25 +451,13 @@ int main() {
                     asm = self.hex_to_pretty(_hex)
                     print('%s ~> %s' % (cbytes(_hex), asm))
                 except Exception as e:
-                    print('ERROR: %s' % e, file=sys.stderr)
-                    if self.verbose >= 3:
-                        print(traceback.format_exc(), file=sys.stderr)
-                        print('--------------------------', file=sys.stderr)
+                    logging.exception('ERROR: %s' % e)
                 _hex = ''
 
 
     def do_conversion(self, input_fp, output_fp, input_fmt, output_fmt):
         global cbytes
-        if self.verbose >= 0:
-            if input_fmt == '-':
-                msg = 'Converting from stdin (%s) ' % input_fmt
-            else:
-                msg = 'Converting %s (%s) ' % (input_fp, input_fmt)
-            if output_fp == '-':
-                msg += 'to stdout (%s)' % output_fmt
-            else:
-                msg += 'into %s (%s)' % (output_fp, output_fmt)
-            print(msg, file=sys.stderr)
+        logging.info(f'Converting from {input_fp.name} ({input_fmt}) to {output_fp.name} ({output_fmt})')
 
         # reading the input
         if input_fp == '-':
@@ -521,12 +472,10 @@ int main() {
         try:
             _output = getattr(self, conv_func_name)(_input)
         except AttributeError as err:
-            print('ERROR: conversion mode "%s" is not supported.' % conv_func_name, file=sys.stderr)
-            if self.verbose >= 3: print(traceback.format_exc(), end='')
+            logging.exception('ERROR: conversion mode "%s" is not supported.' % conv_func_name)
             sys.exit(2)
         except ShellNoobException as err:
-            print('%s' % err, file=sys.stderr)
-            if self.verbose >= 3: print(traceback.format_exc(), end='')
+            logging.exception('%s' % err)
             sys.exit(2)
 
         if not isinstance(_output, bytes):
@@ -542,7 +491,7 @@ int main() {
             os.chmod(output_fp, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
     def do_strace(self, input_fp, input_fmt):
-        if self.verbose >= 3: print('IN do_strace', file=sys.stderr)
+        logging.debug('IN do_strace')
 
         exe_fp = mktemp()
 
@@ -553,10 +502,10 @@ int main() {
 
         if not self.keep_files:
             os.unlink(exe_fp)
-        if self.verbose >= 3: print('OUT do_strace', file=sys.stderr)
+        logging.debug('OUT do_strace')
 
     def do_gdb(self, input_fp, input_fmt):
-        if self.verbose >= 3: print('IN do_gdb', file=sys.stderr)
+        logging.debug('IN do_gdb')
 
         exe_fp = mktemp()
 
@@ -566,9 +515,7 @@ int main() {
         try:
             start_addr = self.get_start_address(exe_fp)
         except:
-            print('WARNING: failed to get the start address :-(', file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
-            print('------------------------', file=sys.stderr)
+            logging.exception('WARNING: failed to get the start address :-(')
 
         if start_addr:
             cmd = 'gdb -ex "break *%s" -q %s' % (start_addr, exe_fp)
@@ -580,7 +527,7 @@ int main() {
         if not self.keep_files:
             os.unlink(exe_fp)
 
-        if self.verbose >= 3: print('OUT do_gdb', file=sys.stderr)
+        logging.debug('OUT do_gdb')
 
 
     #############################
@@ -602,7 +549,7 @@ int main() {
         lines = os.popen('readelf -S %s' % exe_fp).read().split('\n')
         if bits == 32:
             for line in lines:
-                m = re.search('.text\s+\w+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)', line)
+                m = re.search(r'.text\s+\w+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)', line)
                 if not m: continue
                 vm_address = int(m.group(1), 16)
                 file_offset = int(m.group(2), 16)
@@ -611,13 +558,13 @@ int main() {
         elif bits == 64:
             for line in lines:
                 if vm_address is None and file_offset is None:
-                    m = re.search('.text\s+\w+\s+([0-9a-f]+)\s+([0-9a-f]+)', line)
+                    m = re.search(r'.text\s+\w+\s+([0-9a-f]+)\s+([0-9a-f]+)', line)
                     if not m: continue
                     vm_address = int(m.group(1), 16)
                     file_offset = int(m.group(2), 16)
                     continue
                 else:
-                    m = re.search('\s+([0-9a-f]+)\s+[0-9a-f]+', line)
+                    m = re.search(r'\s+([0-9a-f]+)\s+[0-9a-f]+', line)
                     if not m: raise Exception('error while parsing readelf -S (64bit)')
                     size = int(m.group(1), 16)
                     break
@@ -636,13 +583,12 @@ int main() {
     def do_fork_nopper(self, exe_fp):
         lines = os.popen('objdump -d %s' % exe_fp).read().split('\n')
         for line in lines:
-            if self.verbose >= 1:
-                print(line)
-            m = re.search('([0-9a-f]+):\s+[0-9a-f ]+\s+call.*fork', line)
+            logging.info(line)
+            m = re.search(r'([0-9a-f]+):\s+[0-9a-f ]+\s+call.*fork', line)
             if not m: continue
             vm_address = int(m.group(1), 16)
             file_offset = self.get_file_offset_from_vm_address(exe_fp, vm_address)
-            print('Found call to fork @ 0x%x (file offset 0x%x)' % (vm_address, file_offset))
+            logging.debug('Found call to fork @ 0x%x (file offset 0x%x)' % (vm_address, file_offset))
             self.do_exe_patch(exe_fp, b'\x90\x90\x90\x31\xc0', file_offset)
 
     def do_exe_patch(self, exe_fp, data, file_offset=None, vm_address=None, replace=True):
@@ -667,25 +613,25 @@ int main() {
 
     def asm_to_hex(self, asm, with_breakpoint=None):
         global cstr
-        if self.verbose >= 3: print('IN asm_to_hex', file=sys.stderr)
+        logging.debug('IN asm_to_hex')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
         obj = self.asm_to_obj(asm, with_breakpoint)
         _hex = self.obj_to_hex(obj, with_breakpoint=False)
 
-        if self.verbose >= 3: print('OUT asm_to_hex', file=sys.stderr)
+        logging.debug('OUT asm_to_hex')
         return cstr(_hex)
 
     def bin_to_hex(self, _bin, with_breakpoint=None):
         global cbytes
-        if self.verbose >= 3: print('IN bin_to_hex', file=sys.stderr)
+        logging.debug('IN bin_to_hex')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         prepend = self.get_breakpoint_hex() if with_breakpoint else ''
-        if self.verbose >= 3: print('OUT bin_to_hex', file=sys.stderr)
+        logging.debug('OUT bin_to_hex')
         return cbytes(prepend) + binascii.hexlify(_bin)
 
     def obj_to_hex(self, obj, with_breakpoint=None):
-        if self.verbose >= 3: print('IN obj_to_hex', file=sys.stderr)
+        logging.debug('IN obj_to_hex')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         tmp_obj_f = NamedTemporaryFile(delete=False)
@@ -696,7 +642,7 @@ int main() {
         tmp_bin_fp = mktemp()
 
         cmd = 'objcopy -O binary %s %s' % (tmp_obj_fp, tmp_bin_fp)
-        retval = self.exec_cmd(cmd, 'obj_to_hex')
+        retval = self.exec_cmd(cmd)
         try:
             assert retval == 0
         except:
@@ -709,14 +655,14 @@ int main() {
             os.unlink(tmp_obj_fp)
             os.unlink(tmp_bin_fp)
 
-        if self.verbose >= 3: print('OUT obj_to_hex', file=sys.stderr)
+        logging.debug('OUT obj_to_hex')
         return _hex
 
     def c_to_hex(self, c, with_breakpoint=None):
-        if self.verbose >= 3: print('IN c_to_hex', file=sys.stderr)
+        logging.debug('IN c_to_hex')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
-        print('WARNING: c_to_hex just extracts the \\xXX looking parts. Check that everything it\'s fine!', file=sys.stderr)
+        logging.warning('c_to_hex just extracts the \\xXX looking parts. Check that everything it\'s fine!')
 
         def get_next_hex(buf):
             slash_x_idx = buf.find('\\x')
@@ -733,15 +679,15 @@ int main() {
             _hex += hex_byte
         _hex = prepend + _hex
 
-        if self.verbose >= 3: print('OUT c_to_hex', file=sys.stderr)
+        logging.debug('OUT c_to_hex')
         return _hex
 
     def shellstorm_to_hex(self, shellstorm_id, with_breakpoint=None):
         global cstr, urlread
-        if self.verbose >= 3: print('IN shellstorm_to_hex', file=sys.stderr)
+        logging.debug('IN shellstorm_to_hex')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
-        print('WARNING: shellstorm_to_hex just extracts the \\xXX looking parts. Check that everything it\'s fine!', file=sys.stderr)
+        logging.warning('shellstorm_to_hex just extracts the \\xXX looking parts. Check that everything it\'s fine!')
 
         shellstorm_url = self.shellstorm_t % shellstorm_id
         try:
@@ -756,34 +702,32 @@ int main() {
 
         _hex = self.c_to_hex(content, with_breakpoint)
 
-        if self.verbose >= 3: print('OUT shellstorm_to_hex', file=sys.stderr)
+        logging.debug('OUT shellstorm_to_hex')
         return _hex
-
-
 
     ################
     ### hex_to_* ###
     ################
 
     def hex_to_asm(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_asm', file=sys.stderr)
+        logging.debug('IN hex_to_asm')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         obj = self.hex_to_obj(_hex, with_breakpoint)
         asm = self.obj_to_asm(obj, with_breakpoint=False)
 
-        if self.verbose >= 3: print('OUT hex_to_asm', file=sys.stderr)
+        logging.debug('OUT hex_to_asm')
         return asm
 
     def hex_to_obj(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_obj', file=sys.stderr)
+        logging.debug('IN hex_to_obj')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if not isinstance(_hex, str):
             _hex = cstr(_hex)
         if len(_hex) != 0 and _hex.endswith('\n'):
             _hex = _hex.rstrip('\n')
-            print('Warning: stripped a \'\\n\' at the end of the hex', file=sys.stderr)
+            logging.warning('stripped a \'\\n\' at the end of the hex')
         if len(_hex) == 0 or len(_hex) % 2 != 0:
             raise Exception('Not valid _hex: %s' % _hex)
 
@@ -793,46 +737,46 @@ int main() {
         asm = self.hex_to_asm_bytes(_hex)
         obj = self.asm_to_obj(asm, with_breakpoint=False)
 
-        if self.verbose >= 3: print('OUT hex_to_obj', file=sys.stderr)
+        logging.debug('OUT hex_to_obj')
         return obj
 
     def hex_to_exe(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_exe', file=sys.stderr)
+        logging.debug('IN hex_to_exe')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         completec = self.hex_to_completec(_hex, with_breakpoint)
         exe = self.c_to_exe(completec, with_breakpoint=False)
-        if self.verbose >= 3: print('OUT hex_to_exe', file=sys.stderr)
+        logging.debug('OUT hex_to_exe')
         return exe
 
     def hex_to_bin(self, _hex, with_breakpoint=None):
         global cstr
-        if self.verbose >= 3: print('IN hex_to_bin', file=sys.stderr)
+        logging.debug('IN hex_to_bin')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if not isinstance(_hex, str):
             _hex = cstr(_hex)
         if len(_hex) != 0 and _hex.endswith('\n'):
             _hex = _hex.rstrip('\n')
-            print('Warning: stripped a \'\\n\' at the end of the hex', file=sys.stderr)
+            logging.warning('stripped a \'\\n\' at the end of the hex')
         if len(_hex) == 0 or len(_hex) % 2 != 0:
             raise Exception('Not valid _hex: %s' % _hex)
 
         prepend = self.get_breakpoint_hex() if with_breakpoint else ''
         _hex = prepend + _hex
 
-        if self.verbose >= 3: print('OUT hex_to_bin', file=sys.stderr)
+        logging.debug('OUT hex_to_bin')
         return binascii.unhexlify(_hex)
 
     def hex_to_c(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_c', file=sys.stderr)
+        logging.debug('IN hex_to_c')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if not isinstance(_hex, str):
             _hex = cstr(_hex)
         if len(_hex) != 0 and _hex.endswith('\n'):
             _hex = _hex.rstrip('\n')
-            print('Warning: stripped a \'\\n\' at the end of the hex', file=sys.stderr)
+            logging.warning('stripped a \'\\n\' at the end of the hex')
         if len(_hex) == 0 or len(_hex) % 2 != 0:
             raise Exception('Not valid _hex: %s' % _hex)
 
@@ -844,19 +788,19 @@ int main() {
         for idx in range(0, len(_hex), 2):
             content += '\\x%s' % _hex[idx:idx+2]
         out = template % content
-        if self.verbose >= 3: print('OUT hex_to_c', file=sys.stderr)
+        logging.debug('OUT hex_to_c')
         return out
 
     def hex_to_python(self, _hex, with_breakpoint=None):
         global cstr
-        if self.verbose >= 3: print('IN hex_to_python', file=sys.stderr)
+        logging.debug('IN hex_to_python')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if not isinstance(_hex, str):
             _hex = cstr(_hex)
         if len(_hex) != 0 and _hex.endswith('\n'):
             _hex = _hex.rstrip('\n')
-            print('Warning: stripped a \'\\n\' at the end of the hex', file=sys.stderr)
+            logging.warning('stripped a \'\\n\' at the end of the hex')
         if len(_hex) == 0 or len(_hex) % 2 != 0:
             raise Exception('Not valid _hex: %s' % _hex)
 
@@ -869,39 +813,35 @@ int main() {
             content += '\\x%s' % _hex[idx:idx+2]
         out = template % content
 
-        if self.verbose >= 3: print('OUT hex_to_python', file=sys.stderr)
+        logging.debug('OUT hex_to_python')
         return out
 
     def hex_to_bash(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_bash', file=sys.stderr)
+        logging.debug('IN hex_to_bash')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         out = self.hex_to_python(_hex, with_breakpoint)
 
-        if self.verbose >= 3: print('OUT hex_to_bash', file=sys.stderr)
+        logging.debug('OUT hex_to_bash')
         return out
 
-    class AreYouFuckingKiddingMeException(Exception):
-        pass
-
     def hex_to_ruby(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_ruby', file=sys.stderr)
+        logging.debug('IN hex_to_ruby')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
-        # I'm not a ruby fan, and I really needed to put an easter egg :-)
-        raise AreYouFuckingKiddingMeException()
+        raise ShellNoobException()
 
     def hex_to_pretty(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_pretty', file=sys.stderr)
+        logging.debug('IN hex_to_pretty')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         obj = self.hex_to_obj(_hex, with_breakpoint)
         exe = self.obj_to_pretty(obj, with_breakpoint=False)
-        if self.verbose >= 3: print('OUT hex_to_pretty', file=sys.stderr)
+        logging.debug('OUT hex_to_pretty')
         return exe
 
     def obj_to_pretty(self, obj, with_breakpoint=None):
-        if self.verbose >= 3: print('IN obj_to_pretty', file=sys.stderr)
+        logging.debug('IN obj_to_pretty')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if with_breakpoint:
@@ -909,9 +849,9 @@ int main() {
 
         if self.need_to_align():
             _hex = self.obj_to_hex(obj)
-            if self.debug: print('hex lenght: ',len(_hex), file=sys.stderr)
+            logging.debug('hex lenght: ',len(_hex))
             aligned_hex = self.align_hex(_hex)
-            if self.debug: print('aligned hex lenght: ' , len(aligned_hex), file=sys.stderr)
+            logging.debug('aligned hex lenght: ' , len(aligned_hex))
             if _hex != aligned_hex:
                 obj = self.hex_to_obj(aligned_hex, with_breakpoint=False)
 
@@ -944,7 +884,7 @@ int main() {
             os.unlink(tmp_obj_fp)
             os.unlink(tmp_pretty_fp)
 
-        if self.verbose >= 3: print('OUT obj_to_pretty', file=sys.stderr)
+        logging.debug('OUT obj_to_pretty')
         return pretty
 
 
@@ -954,7 +894,7 @@ int main() {
 
     def asm_to_obj(self, asm, with_breakpoint=None):
         global cstr
-        if self.verbose >= 3: print('IN asm_to_obj', file=sys.stderr)
+        logging.debug('IN asm_to_obj')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if isinstance(asm, bytes):
@@ -986,11 +926,11 @@ int main() {
             os.unlink(tmp_asm_fp)
             os.unlink(tmp_obj_fp)
 
-        if self.verbose >= 3: print('OUT asm_to_obj', file=sys.stderr)
+        logging.debug('OUT asm_to_obj')
         return obj
 
     def obj_to_asm(self, obj, with_breakpoint=None):
-        if self.verbose >= 3: print('IN obj_to_asm', file=sys.stderr)
+        logging.debug('IN obj_to_asm')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if self.need_to_align():
@@ -1008,12 +948,12 @@ int main() {
         cmd = 'objdump -d %s %s | tr -s " "' % (objdump_options,
                                     tmp_obj_fp,
                                    )
-        if self.verbose >= 2: print('(obj_to_asm) Executing: %s' % cmd, file=sys.stderr)
+        logging.info('(obj_to_asm) Executing: %s' % cmd)
         obj_out = os.popen(cmd).read()
         lines = obj_out.split('\n')
         started = False
-
-        prepend = hex_to_asm_bytes(self.get_breakpoint_hex()) if with_breakpoint else ''
+        comment_char = ""
+        prepend = self.hex_to_asm_bytes(self.get_breakpoint_hex()) if with_breakpoint else ''
 
         out_lines = []
         max_asm_len, max_help_asm_len = 0, 0
@@ -1026,7 +966,7 @@ int main() {
             comment_char = self.get_comment_as_char()
 
             # asm started
-            m = re.search('[0-9a-f]+:\s+([0-9a-f ]+)\t(.*)$', line)
+            m = re.search(r'[0-9a-f]+:\s+([0-9a-f ]+)\t(.*)$', line)
             if not m:
                 continue
             _hex = m.group(1).replace(' ', '').strip(' \t\n')
@@ -1059,21 +999,21 @@ int main() {
 
         shellcode = self.shellcode_t % out
 
-        if self.verbose >= 3: print('OUT obj_to_asm', file=sys.stderr)
+        logging.debug('OUT obj_to_asm')
         return shellcode
 
     def asm_to_exe(self, asm, with_breakpoint=None):
-        if self.verbose >= 3: print('IN asm_to_exe', file=sys.stderr)
+        logging.debug('IN asm_to_exe')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         _hex = self.asm_to_hex(asm, with_breakpoint)
         exe = self.hex_to_exe(_hex, with_breakpoint=False)
 
-        if self.verbose >= 3: print('OUT asm_to_exe', file=sys.stderr)
+        logging.debug('OUT asm_to_exe')
         return exe
 
     def obj_to_exe(self, obj, with_breakpoint=None):
-        if self.verbose >= 3: print('IN obj_to_exe', file=sys.stderr)
+        logging.debug('IN obj_to_exe')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if with_breakpoint:
@@ -1098,19 +1038,19 @@ int main() {
             os.unlink(tmp_obj_fp)
             os.unlink(tmp_exe_fp)
 
-        if self.verbose >= 3: print('OUT obj_to_exe', file=sys.stderr)
+        logging.debug('OUT obj_to_exe')
         return exe
 
     def hex_to_safeasm(self, _hex, with_breakpoint=None):
         global cstr
-        if self.verbose >= 3: print('IN hex_to_safeasm', file=sys.stderr)
+        logging.debug('IN hex_to_safeasm')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         if not isinstance(_hex, str):
             _hex = cstr(_hex)
         if len(_hex) != 0 and _hex.endswith('\n'):
             _hex = _hex.rstrip('\n')
-            print('Warning: stripped a \'\\n\' at the end of the hex', file=sys.stderr)
+            logging.warning('stripped a \'\\n\' at the end of the hex')
         if len(_hex) == 0 or len(_hex) % 2 != 0:
             raise Exception('Not valid _hex: %s' % _hex)
 
@@ -1120,23 +1060,23 @@ int main() {
         asm = self.hex_to_asm_bytes(_hex)
         shellcode = self.shellcode_t % asm
 
-        if self.verbose >= 3: print('OUT hex_to_safeasm', file=sys.stderr)
+        logging.debug('OUT hex_to_safeasm')
         return shellcode
 
     def hex_to_completec(self, _hex, with_breakpoint=None):
-        if self.verbose >= 3: print('IN hex_to_completec', file=sys.stderr)
+        logging.debug('IN hex_to_completec')
         with_breakpoint = with_breakpoint if with_breakpoint is not None else self.with_breakpoint
 
         c = self.hex_to_c(_hex, with_breakpoint)
         completec = self.completec_t % c
 
-        if self.verbose >= 3: print('OUT hex_to_completec', file=sys.stderr)
+        logging.debug('OUT hex_to_completec')
         return completec
 
     def c_to_exe(self, c, with_breakpoint=None):
         global cbytes
         # NOTE assumption: the input is "compileable C"
-        if self.verbose >= 3: print('IN c_to_exe', file=sys.stderr)
+        logging.debug('IN c_to_exe')
 
         if with_breakpoint:
             raise Exception('the with_breakpoint option is NOT supported in c_to_exe')
@@ -1160,7 +1100,7 @@ int main() {
             os.unlink(tmp_c_fp)
             os.unlink(tmp_exe_fp)
 
-        if self.verbose >= 3: print('OUT c_to_exe', file=sys.stderr)
+        logging.debug('OUT c_to_exe')
         return exe
 
 
@@ -1225,7 +1165,7 @@ int main() {
             f.write(cbytes(c_prog))
 
         cmd = 'gcc %s -o %s' % (tmp_c_fp, tmp_exe_fp)
-        retval = self.exec_cmd(cmd, 'include_and_body_to_exe_fp')
+        retval = self.exec_cmd(cmd)
         if retval != 0:
             output = ''
             raise ShellNoobException()
@@ -1252,7 +1192,7 @@ int main() {
         raise Exception('start address not found for %s' % exe_fp)
 
     def exec_cmd(self, cmd, redirect_stderr=False, caller=None):
-        if self.verbose >= 2: print('(exec_cmd: "%s") Executing: "%s"' % (caller, cmd), file=sys.stderr)
+        logging.info('(exec_cmd: "%s") Executing: "%s"' % (caller, cmd))
 
         if redirect_stderr:
             with open('/dev/null', 'wb') as f:
@@ -1260,7 +1200,7 @@ int main() {
         else:
             retval = call(cmd, shell=True)
 
-        if self.verbose >= 2: print('(exec_cmd: "%s") Ret value: %s' % (caller, retval), file=sys.stderr)
+        logging.info('(exec_cmd: "%s") Ret value: %s' % (caller, retval))
         return retval
 
     def do_objdump_switch(self):
@@ -1283,14 +1223,13 @@ int main() {
         hardware = hardware if hardware is not None else self.hardware
         for e_hardware in self.hw_with_align:
             if not re.search(e_hardware, hardware): continue
-            if self.debug: print('MATCH with %s ~> %s' % (entry, options), file=sys.stderr)
             return True
         return False
 
     def align_hex(self, _hex):
         assert len(_hex) % 2 == 0
         if (len(_hex)/2) % 4 != 0:
-            _hex = _hex + '00'*(4 - ((len(_hex)/2) % 4))
+            _hex = _hex + '00'*(4 - (int(len(_hex)/2) % 4))
         assert len(_hex) % 8 == 0
         return _hex
 
@@ -1306,259 +1245,187 @@ int main() {
     @staticmethod
     def do_install(force=False):
         if os.getuid() != 0:
-            print('ERROR: I need root!', file=sys.stderr)
+            logging.error('ERROR: I need root!')
             sys.exit(1)
         install_dir = '/usr/local/bin'
         shellnoob_fp = os.path.join(install_dir, 'snoob')
-        print('This will copy shellnoob into %s' % shellnoob_fp, file=sys.stderr)
+        print('This will copy shellnoob into %s' % shellnoob_fp)
         if not force:
             input('Press a key to proceed..')
         shutil.copyfile(__file__, shellnoob_fp)
         os.chmod(shellnoob_fp, stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)
-        print('SUCCESS. "snoob -h" should display shellnoob\'s help', file=sys.stderr)
+        print('SUCCESS. "snoob -h" should display shellnoob\'s help')
 
     @staticmethod
     def do_uninstall(force=False):
         if os.getuid() != 0:
-            print('ERROR: I need root!', file=sys.stderr)
+            logging.error('ERROR: I need root!')
             sys.exit(1)
         install_dir = '/usr/local/bin'
         shellnoob_fp = os.path.join(install_dir, 'snoob')
-        print('This will delete shellnoob from %s' % shellnoob_fp, file=sys.stderr)
+        print('This will delete shellnoob from %s' % shellnoob_fp)
         if not force:
             input('Press a key to proceed..')
         os.unlink(shellnoob_fp)
 
 
-class ShellNoobException(Exception):
-    pass
+class FormatAction(argparse.Action):
 
-def main():
+    FormatValue = namedtuple("FormatValue", ["format", "value"])
 
-    args = sys.argv[1:]
+    def __init__(self,format=None,**kwargs):
+        self.format:Optional[OutputFormat] = format
+        super(FormatAction, self).__init__(**kwargs)
 
-    ########################################################################
-    # WARNING  WARNING  WARNING WARNING  WARNING WARNING  WARNING  WARNING #
-    # This is the most awful CLI argument parsing ever. I started to do    #
-    # it manually as I wanted a uber flexible CLI interface. I'm pretty    #
-    # sure it's possible to achieve the same with optparse/argparse, but   #
-    # I'm too noob for that. Somebody should write a OptParseNoob tool :-) #
-    ########################################################################
+    def __call__(self, parser, namespace, values: io.TextIOWrapper, option_string=None):
+        if not self.format:
+            try:
+                self.format = OutputFormat(values.name.split(".")[-1].lower())
+            except ValueError:
+                raise Exception("Unsupported Format")
+        setattr(namespace, self.dest, FormatAction.FormatValue(self.format, values))
 
-    # check for help
-    if '-h' in args or '--help' in args or len(args) == 0:
-        print_usage()
+class OptionalBoolean(argparse.Action):
+
+    def __init__(self,
+                 option_strings,
+                 dest,
+                 const=None,
+                 default=None,
+                 required=False,
+                 help=None,
+                 metavar=None):
+        super(OptionalBoolean, self).__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            const=const,
+            default=default,
+            required=required,
+            help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, self.const if option_string else self.default)
+
+def parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--install", dest="install", action="store_true",
+                        help='this just copies the script in a convinient position')
+    parser.add_argument("--uninstall", dest="uninstall", action="store_true",
+                        help="this just undo the action command")
+    parser.add_argument("--64", dest="is64", action="store_true",
+                        help="64 bits mode, default: 32 bits")
+    parser.add_argument("--intel", dest="isIntel", action="store_true",
+                        help="intel syntax mode, default: att")
+    parser.add_argument("--breakpoint","-c", dest="addBreakpoint", action="store_true",
+                        help="prepend a breakpoint (Warning: only few platforms/OS are supported!)")
+    parser.add_argument("--keepfiles", "-k", dest="keepFiles", action="store_true",
+                        help="keep files after operations")
+    parser.add_argument("--verbosity", "-v", action='count', default=0,
+                        help='Verbosity (can be repeat 2 times)')
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help='Quite Mode')    
+
+    parser.add_argument("--force", action="store_true",
+                        help='Force mode for install and uninstall')    
+
+
+    subparsers = parser.add_subparsers(dest="action")
+    subparsers.default = 'cli'
+    cli = subparsers.add_parser('cli', help="CLI Mode")
+    from_format_group = cli.add_mutually_exclusive_group(required=True)
+    for format in InputFormat:
+        file_type = argparse.FileType("r") if format != InputFormat.SHELLSTORM else str
+        from_format_group.add_argument(f"--from-{format}",dest="input", action=FormatAction, format=format, type=file_type,
+                                        help=f'{format} as input',)
+    from_format_group.add_argument("--from",dest="input", action=FormatAction, type=argparse.FileType("w"))
+
+    to_format_group = cli.add_mutually_exclusive_group(required=True)
+    for format in OutputFormat:
+        file_type = argparse.FileType("w") if format != InputFormat.SHELLSTORM else str        
+        to_format_group.add_argument(f"--to-{format}",dest="output", action=FormatAction, format=format, type=file_type,
+                                        help=f'{format} as output')   
+    to_format_group.add_argument(f"--to-gdb",dest="output", action="store_const", const="gdb",
+                                    help=f'compiles it & run gdb & set breakpoint on entrypoint.')   
+    to_format_group.add_argument(f"--to-strace",dest="output", action="store_const", const="strace",
+                                    help=f'compiles it & run strace.')   
+    to_format_group.add_argument("--to",dest="output", action=FormatAction, type=argparse.FileType("w"))
+
+
+    
+    interractive = subparsers.add_parser('interactive', help="Interractive Mode", argument_default=None)
+    interractive_group = interractive.add_mutually_exclusive_group()
+    interractive_group.add_argument("--to-opcode", dest='toOpcode', action=OptionalBoolean, const=True, default=None,
+                       help="Take ASM as input and output opcode")
+    interractive_group.add_argument("--to-asm", dest='toOpcode', action=OptionalBoolean, const=False, default=None,
+                       help="Take OpCode as input and output ASM")
+
+    constPlugin = subparsers.add_parser('get-const', help="Const Plugin")
+    constPlugin.add_argument('const', action="store",
+                             help="Const value to retreive ")
+
+    sysnumPlugin = subparsers.add_parser('get-sysnum', help="Sysnum Plugin")
+    sysnumPlugin.add_argument('sysnum', action="store",
+                             help="Sysnum value to retreive ")
+
+    errnoPlugin = subparsers.add_parser('get-errno', help="Errno Plugin")
+    errnoPlugin.add_argument('errno', action="store",
+                             help="Errno value to retreive ")
+    
+    filePatchPlugin = subparsers.add_parser('file-patch', help="File Patch Plugin")
+    filePatchPlugin.add_argument('exe_fp', action="store",
+                                 help="Executable to patch")
+    filePatchPlugin.add_argument('file_offset', action="store",
+                                 help="Offset to in file.")
+    filePatchPlugin.add_argument('data', action="store", type=binascii.unhexlify,
+                                 help="Data to put at offet (hexstr).")
+
+    vmPatchPlugin = subparsers.add_parser('vm-patch', help="VM Patch Plugin")
+    vmPatchPlugin.add_argument('exe_fp', action="store",
+                               help="VM to patch")
+    vmPatchPlugin.add_argument('vm_address', action="store",
+                               help="Address to patch.")
+    vmPatchPlugin.add_argument('data', action="store", type=binascii.unhexlify,
+                               help="Data to put at offet (hexstr).")    
+
+    forkNopPlugin = subparsers.add_parser('fork-nopper', help="Forkn Nopper Plugin - this nops out the calls to fork().")
+    forkNopPlugin.add_argument('exe_fork', action="store",
+                               help="Executable to patch")
+
+    return parser.parse_args()
+
+def new_main(args):
+    loggingLevel = [logging.ERROR, logging.INFO, logging.DEBUG]
+    logging.basicConfig(stream=sys.stderr, level=loggingLevel[args.verbosity])
+    if args.install:
+        ShellNoob.do_install(args.force)
+        sys.exit(0)
+    if args.uninstall:
+        ShellNoob.do_uninstall(args.force)
         sys.exit(0)
 
-    # check for install/uninstall
-    if '--install' in args:
-        force = True if '--force' in args else False
-        ShellNoob.do_install(force)
-        sys.exit(0)
-    elif '--uninstall' in args:
-        force = True if '--force' in args else False
-        ShellNoob.do_uninstall(force)
-        sys.exit(0)
-
-
-    # parse the switches
-    flag_64_bit = False
-    if '--64' in args:
-        flag_64_bit = True
-        args.remove('--64')
-    flag_intel = False
-    if '--intel' in args:
-        flag_intel = True
-        args.remove('--intel')
-    with_breakpoint = False
-    if '-c' in args:
-        with_breakpoint = True
-        args.remove('-c')
-    keep_files = False
-    if '-k' in args:
-        keep_files = True
-        args.remove('-k')
-    verbose = 0
-    if '-vvvv' in args:
-        verbose = 4
-        args.remove('-vvvv')
-    if '-vvv' in args:
-        verbose = 3
-        args.remove('-vvv')
-    elif '-vv' in args:
-        verbose = 2
-        args.remove('-vv')
-    elif '-v' in args:
-        verbose = 1
-        args.remove('-v')
-    if '-q' in args:
-        verbose = -1
-        args.remove('-q')
-
-    snoob = ShellNoob(flag_64_bit=flag_64_bit, flag_intel=flag_intel,
-                      with_breakpoint=with_breakpoint, verbose=verbose,
-                      keep_files=keep_files
-                     )
-
-    # parse the plugin switches
-    if '-i' in args:
-        snoob.do_interactive_mode(args)
-        sys.exit(0)
-    if '--get-const' in args:
-        idx = args.index('--get-const')
-        const = args[idx+1]
-        snoob.do_resolve_const(const)
-        sys.exit(0)
-    if '--get-sysnum' in args:
-        idx = args.index('--get-sysnum')
-        syscall = args[idx+1]
-        snoob.do_resolve_syscall(syscall)
-        sys.exit(0)
-    if '--get-errno' in args:
-        idx = args.index('--get-errno')
-        errno = args[idx+1]
-        snoob.do_resolve_errno(errno)
-        sys.exit(0)
-    do_strace_flag = False
-    if '--to-strace' in args:
-        do_strace_flag = True
-        args.remove('--to-strace')
-    do_gdb_flag = False
-    if '--to-gdb' in args:
-        do_gdb_flag = True
-        args.remove('--to-gdb')
-
-    if '--fork-nopper' in args:
-        idx = args.index('--fork-nopper')
-        exe_fp = args[idx+1]
-        snoob.do_fork_nopper(exe_fp)
-        sys.exit(0)
-    if '--file-patch' in args:
-        idx = args.index('--file-patch')
-        exe_fp = args[idx+1]
-        file_offset = int(args[idx+2], 16)
-        data = binascii.unhexlify(args[idx+3])
-        snoob.do_exe_patch(exe_fp, data, file_offset=file_offset)
-        sys.exit(0)
-    if '--vm-patch' in args:
-        idx = args.index('--vm-patch')
-        exe_fp = args[idx+1]
-        vm_address = int(args[idx+2], 16)
-        data = binascii.unhexlify(args[idx+3])
-        snoob.do_exe_patch(exe_fp, data, vm_address=vm_address)
-        sys.exit(0)
-
-    # parse the conversion arguments
-
-    curr_arg_idx = 0
-
-    # determine the input format
-    input_fmt = None
-    curr_arg = args[curr_arg_idx]
-    if curr_arg.startswith('--from-'):
-        input_fmt = curr_arg[len('--from-'):].lower()
-        if input_fmt not in snoob.INPUT_FMT:
-            raise Exception('input format "%s" not supported' % input_fmt)
-        curr_arg_idx += 1
-
-    input_fp = args[curr_arg_idx]
-    if input_fmt != 'shellstorm' and input_fp != '-':
-        input_fp = os.path.abspath(input_fp)
-        if not os.path.isfile(input_fp):
-            raise Exception('file %s does NOT exist' % input_fp)
-    curr_arg_idx += 1
-
-    if not input_fmt:
-        # ok, let's guess the input fmt
-        dot_idx = input_fp.rfind('.')
-        if dot_idx == -1:
-            raise Exception('Failed to guess the input format :/')
-        ext = input_fp[dot_idx+1:]
-        if ext in ['asm', 's', 'S', 'shell']:
-            input_fmt = 'asm'
-        elif ext in ['o', 'obj']:
-            input_fmt = 'obj'
-        elif ext in ['bin']:
-            input_fmt = 'bin'
-        elif ext in ['hex']:
-            input_fmt = 'hex'
-        elif ext in ['c', 'C']:
-            input_fmt = 'c'
+    snoob = ShellNoob(args.is64, args.isIntel, args.addBreakpoint, args.verbosity, args.keepFiles)
+    if args.action == "interractive":
+        snoob.do_interactive_mode(args.toOpcode)
+    elif args.action == "get-const":
+        snoob.do_resolve_const(args.const)
+    elif args.action == "get-sysnum":
+        snoob.do_resolve_const(args.sysnum)
+    elif args.action == "get-errno":
+        snoob.do_resolve_const(args.errno)
+    elif args.action == "file-patch":
+        snoob.do_exe_patch(args.exe_fp, args.data, file_offset=args.file_offset)
+    elif args.action == "vm-patch":
+        snoob.do_exe_patch(args.exe_fp, args.data, vm_address=args.vm_address)
+    elif args.action == "fork-nopper":
+        snoob.do_fork_nopper(args.exe_fork)
+    elif args.action == "cli":
+        if args.output == "gdb":
+            snoob.do_gdb(args.input.value, args.input.format)
+        elif args.output == "strace":
+            snoob.do_strace(args.input.value, args.input.format)          
         else:
-            raise Exception('Input format "%s" is not supported' % input_fmt)
-
-
-    if do_strace_flag:
-        if snoob.verbose >= 1: print('do_strace mode selected', file=sys.stderr)
-        snoob.do_strace(input_fp, input_fmt)
-        sys.exit(0)
-    if do_gdb_flag:
-        if snoob.verbose >= 1: print('do_gdb mode selected', file=sys.stderr)
-        snoob.do_gdb(input_fp, input_fmt)
-        sys.exit(0)
-
-
-    output_fmt = None
-    curr_arg = args[curr_arg_idx]
-    if curr_arg.startswith('--to-'):
-        output_fmt = curr_arg[len('--to-'):].lower()
-        if output_fmt not in snoob.OUTPUT_FMT:
-            raise Exception('output format "%s" not supported' % output_fmt)
-        curr_arg_idx += 1
-
-    output_fp = None
-    if curr_arg_idx < len(args):
-        output_fp = args[curr_arg_idx]
-        curr_arg_idx += 1
-
-    if not output_fmt:
-        # ok, let's guess the output fmt
-        dot_idx = output_fp.rfind('.')
-        if dot_idx == -1:
-            raise Exception('Failed to guess the output format :/')
-        ext = output_fp[dot_idx+1:]
-        if ext in ['asm', 's', 'S', 'shell']:
-            output_fmt = 'asm'
-        elif ext in ['o', 'obj']:
-            output_fmt = 'obj'
-        elif ext in ['exe']:
-            output_fmt = 'exe'
-        elif ext in ['bin']:
-            output_fmt = 'bin'
-        elif ext in ['hex']:
-            output_fmt = 'hex'
-        elif ext in ['c', 'C']:
-            output_fmt = 'c'
-        elif ext in ['py', 'python']:
-            output_fmt = 'python'
-        elif ext in ['sh', 'bash']:
-            output_fmt = 'bash'
-        elif ext in ['rb', 'ruby']:
-            output_fmt = 'ruby'
-        elif ext in ['pretty']:
-            output_fmt = 'pretty'
-        elif ext in ['safeasm']:
-            output_fmt = 'safeasm'
-        else:
-            raise Exception('Output format "%s" is not supported' % output_fmt)
-
-    if output_fp == '-':
-        pass
-    elif output_fp != None:
-        output_fp = os.path.abspath(output_fp)
-    elif input_fp and input_fp != '-':
-        # choose the output_fp starting from the input_fp and input_fmt
-        input_pfx = input_fp[:input_fp.rfind('.')]
-        if output_fmt == 'completec':
-            output_ext = 'c'
-        else:
-            output_ext = output_fmt
-        output_fp = '%s.%s' % (input_pfx, output_ext)
-    else:
-        raise Exception('Specify the input/output filename!')
-
-    snoob.do_conversion(input_fp, output_fp, input_fmt, output_fmt)
-
+            snoob.do_conversion(args.input.value, args.output.value, args.input.format, args.output.format)
 
 if __name__== '__main__':
-    main()
+    new_main(parser())
