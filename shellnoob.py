@@ -459,14 +459,10 @@ int main() {
         global cbytes
         logging.info(f'Converting from {input_fp.name} ({input_fmt}) to {output_fp.name} ({output_fmt})')
 
-        # reading the input
-        if input_fp == '-':
-            _input = sys.stdin.read()
+        if input_fmt == 'shellstorm':
+            _input = input_fp  # shellcode id
         else:
-            if input_fmt == 'shellstorm':
-                _input = input_fp  # shellcode id
-            else:
-                _input = open(input_fp, 'rb').read()
+            _input = input_fp.read()
 
         conv_func_name = '%s_to_%s' % (input_fmt, output_fmt)
         try:
@@ -481,10 +477,7 @@ int main() {
         if not isinstance(_output, bytes):
             _output = cbytes(_output)
         # writing the output
-        if output_fp == '-':
-            sys.stdout.write(_output.decode(sys.stdout.encoding))
-        else:
-            open(output_fp, 'wb').write(_output)
+        output_fp.write(_output)
 
         if output_fmt == 'exe' and output_fp != '-':
             # chmod 700
@@ -1335,21 +1328,21 @@ def parser():
     cli = subparsers.add_parser('cli', help="CLI Mode")
     from_format_group = cli.add_mutually_exclusive_group(required=True)
     for format in InputFormat:
-        file_type = argparse.FileType("r") if format != InputFormat.SHELLSTORM else str
+        file_type = argparse.FileType("rb") if format != InputFormat.SHELLSTORM else str
         from_format_group.add_argument(f"--from-{format}",dest="input", action=FormatAction, format=format, type=file_type,
                                         help=f'{format} as input',)
-    from_format_group.add_argument("--from",dest="input", action=FormatAction, type=argparse.FileType("w"))
+    from_format_group.add_argument("--from",dest="input", action=FormatAction, type=argparse.FileType("rb"))
 
     to_format_group = cli.add_mutually_exclusive_group(required=True)
     for format in OutputFormat:
-        file_type = argparse.FileType("w") if format != InputFormat.SHELLSTORM else str        
+        file_type = argparse.FileType("wb") if format != InputFormat.SHELLSTORM else str        
         to_format_group.add_argument(f"--to-{format}",dest="output", action=FormatAction, format=format, type=file_type,
                                         help=f'{format} as output')   
     to_format_group.add_argument(f"--to-gdb",dest="output", action="store_const", const="gdb",
                                     help=f'compiles it & run gdb & set breakpoint on entrypoint.')   
     to_format_group.add_argument(f"--to-strace",dest="output", action="store_const", const="strace",
                                     help=f'compiles it & run strace.')   
-    to_format_group.add_argument("--to",dest="output", action=FormatAction, type=argparse.FileType("w"))
+    to_format_group.add_argument("--to",dest="output", action=FormatAction, type=argparse.FileType("wb"))
 
 
     
